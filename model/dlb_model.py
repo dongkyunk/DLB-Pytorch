@@ -5,26 +5,6 @@ import pytorch_lightning as pl
 from torch_optimizer import MADGRAD
 
 
-def criterion_barlow(z1, z2, lambd=0.0051):
-    # empirical cross-correlation matrix
-    c = z1.T @ z2
-
-    # sum the cross-correlation matrix between all gpus
-    c.div_(z1.shape[0])
-    # torch.distributed.all_reduce(c)
-
-    def off_diagonal(x):
-        # return a flattened view of the off-diagonal elements of a square matrix
-        n, m = x.shape
-        assert n == m
-        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
-
-    on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-    off_diag = off_diagonal(c).pow_(2).sum()
-    loss = on_diag + lambd * off_diag
-    return loss
-
-
 class DLBModel(pl.LightningModule):
     """Self-Distillation from the Last Mini-Batch for Consistency Regularization
     """    
@@ -35,7 +15,6 @@ class DLBModel(pl.LightningModule):
         self.fc = nn.Linear(1000, cfg.num_classes)
 
         self.criterion = nn.CrossEntropyLoss()
-        self.criterion_barlow = criterion_barlow
         self.train_acc = torchmetrics.Accuracy()
         self.val_acc = torchmetrics.Accuracy()
         self.lr = cfg.lr
@@ -45,12 +24,11 @@ class DLBModel(pl.LightningModule):
     def _init_last_batch_memory(self):
         self.last_images = None
         self.last_logits = None
-        self.last_embds = None
 
     def forward(self, x):
-        embd = self.model(x)
-        logit = self.fc(embd)
-        return logit, embd
+        x = self.model(x)
+        x = self.fc(x)
+        return x
 
     def shared_step(self, batch, batch_idx):
         images, target = batch
@@ -59,26 +37,22 @@ class DLBModel(pl.LightningModule):
         if self.last_images is not None:
             images = torch.cat([images, self.last_images], dim=0)
 
-            logit, embd = self(images)
+            logit = self(images)
             
             logit, logit_last = logit[:batch_size], logit[batch_size:]
-            embd, embd_last = embd[:batch_size], embd[batch_size:]
 
             loss_org = self.criterion(logit, target)
             loss_dlb = self.criterion(logit_last, self.last_logits)
-            loss_barlow = self.criterion_barlow(embd_last, self.last_embds)*1e-3
         else:
-            logit, embd = self(images)
+            logit = self(images)
             loss_org = self.criterion(logit, target)
             loss_dlb = torch.tensor(0.0)
-            loss_barlow = torch.tensor(0.0)
 
         # Update last
         self.last_images = images[:batch_size].detach()
         self.last_logits = torch.softmax(logit.detach(), dim=1)
-        self.last_embds = embd.detach()
 
-        loss = loss_org + loss_dlb + loss_barlow
+        loss = loss_org + loss_dlb
 
         return dict(
             loss=loss,
@@ -87,7 +61,6 @@ class DLBModel(pl.LightningModule):
             logs=dict(
                 loss_org=loss_org.detach(),
                 loss_dlb=loss_dlb.detach(),
-                loss_barlow=loss_barlow.detach(),
             )
         )
     def on_train_epoch_end(self):
